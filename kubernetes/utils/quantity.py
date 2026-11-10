@@ -11,7 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation
+
+_EXPONENTS = {
+    "n": -3,
+    "u": -2,
+    "m": -1,
+    "K": 1,
+    "k": 1,
+    "M": 2,
+    "G": 3,
+    "T": 4,
+    "P": 5,
+    "E": 6,
+}
+
+# Only these prefixes exist in base 1024 (Ki, Mi, Gi, Ti, Pi, Ei).
+_BINARY_PREFIXES = "KMGTPE"
 
 
 def parse_quantity(quantity):
@@ -35,17 +51,14 @@ def parse_quantity(quantity):
     if isinstance(quantity, (int, float, Decimal)):
         return Decimal(quantity)
 
-    exponents = {"n": -3, "u": -2, "m": -1, "K": 1, "k": 1, "M": 2,
-                 "G": 3, "T": 4, "P": 5, "E": 6}
-
     quantity = str(quantity)
     number = quantity
     suffix = None
     if len(quantity) >= 2 and quantity[-1] == "i":
-        if quantity[-2] in exponents:
+        if quantity[-2] in _EXPONENTS:
             number = quantity[:-2]
             suffix = quantity[-2:]
-    elif len(quantity) >= 1 and quantity[-1] in exponents:
+    elif len(quantity) >= 1 and quantity[-1] in _EXPONENTS:
         number = quantity[:-1]
         suffix = quantity[-1:]
 
@@ -58,18 +71,76 @@ def parse_quantity(quantity):
         return number
 
     if suffix.endswith("i"):
+        # handle SI inconsistency: "ki", "mi", "ni" and "ui" are not valid binary suffixes
+        if suffix[0] not in _BINARY_PREFIXES:
+            raise ValueError("{} has unknown suffix".format(quantity))
         base = 1024
     elif len(suffix) == 1:
         base = 1000
     else:
         raise ValueError("{} has unknown suffix".format(quantity))
 
-    # handly SI inconsistency
-    if suffix == "ki":
+    if suffix[0] not in _EXPONENTS:
         raise ValueError("{} has unknown suffix".format(quantity))
 
-    if suffix[0] not in exponents:
-        raise ValueError("{} has unknown suffix".format(quantity))
+    exponent = Decimal(_EXPONENTS[suffix[0]])
+    try:
+        return number * (base ** exponent)
+    except DecimalException as exc:
+        raise ValueError("Invalid quantity: {}".format(quantity)) from exc
 
-    exponent = Decimal(exponents[suffix[0]])
-    return number * (base ** exponent)
+
+def format_quantity(quantity_value, suffix, quantize=None) -> str:
+    """
+    Takes a decimal and produces a string value in kubernetes' canonical quantity form,
+    like "200Mi".Users can specify an additional decimal number to quantize the output.
+
+    Example -  Relatively increase pod memory limits:
+
+    # retrieve my_pod
+    current_memory: Decimal = parse_quantity(my_pod.spec.containers[0].resources.limits.memory)
+    desired_memory = current_memory * 1.2
+    desired_memory_str = format_quantity(desired_memory, suffix="Gi", quantize=Decimal(1))
+    # patch pod with desired_memory_str
+
+    'quantize=Decimal(1)' ensures that the result does not contain any fractional digits.
+
+    Supported SI suffixes:
+    base1024: Ki | Mi | Gi | Ti | Pi | Ei
+    base1000: n | u | m | "" | k | M | G | T | P | E
+
+    See https://github.com/kubernetes/apimachinery/blob/master/pkg/api/resource/quantity.go
+
+    Input:
+    quantity: Decimal.  Quantity as a number which is supposed to converted to a string
+                        with SI suffix.
+    suffix: string.     The desired suffix/unit-of-measure of the output string
+    quantize: Decimal.  Can be used to round/quantize the value before the string
+                        is returned. Defaults to None.
+
+    Returns:
+    string. Canonical Kubernetes quantity string containing the SI suffix.
+
+    Raises:
+    ValueError if the SI suffix is not supported.
+    """
+
+    if not suffix:
+        return str(quantity_value)
+
+    if suffix.endswith("i"):
+        if suffix[0] not in _BINARY_PREFIXES:
+            raise ValueError(f"{quantity_value} has unknown suffix")
+        base = 1024
+    elif len(suffix) == 1:
+        base = 1000
+    else:
+        raise ValueError(f"{quantity_value} has unknown suffix")
+
+    if suffix[0] not in _EXPONENTS:
+        raise ValueError(f"{quantity_value} has unknown suffix")
+
+    different_scale = quantity_value / (Decimal(base) ** _EXPONENTS[suffix[0]])
+    if quantize is not None:
+        different_scale = different_scale.quantize(quantize)
+    return format(different_scale, "f") + suffix
